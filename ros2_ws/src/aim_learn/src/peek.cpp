@@ -1,4 +1,8 @@
-﻿#include <cmath>
+// 自瞄节点：订阅 /aim_sim/armors，发布 /aim_sim/command。
+// ROS 侧 pitch 抬头为正；指令的 header/session_id 必须复制观测。
+// 一次回调六步：反推车心 → 更新速度/角速度 → 预测位姿 → 选板 → 解仰角 → 发指令。
+
+#include <cmath>
 #include <cstdio>
 #include <vector>
 #include "rclcpp/rclcpp.hpp"
@@ -8,26 +12,26 @@
 using rm_aim_sim_bridge::msg::ArmorCornersArray;
 using rm_aim_sim_bridge::msg::AimCommand;
 
-rclcpp::Publisher<AimCommand>::SharedPtr g_pub;   // 全局发布器
+rclcpp::Publisher<AimCommand>::SharedPtr g_pub;
 
-const double V        = 23.0;          // 弹丸初速 m/s
+const double V        = 23.0;          // 弹速 m/s
 const double G        = 9.7833;        // 重力 m/s^2
-const double L        = 0.22;          // 枪口比云台中心前伸 0.22 m
-const double R_PLATE  = 0.2480696;     // 底盘旋转中心 → 装甲板中心的距离（步兵 3 预设）
+const double L        = 0.22;          // 枪口前伸量
+const double R_PLATE  = 0.2480696;     // 车心 → 板中心（步兵 3 预设）
 const double TAU      = 6.283185307179586;
 
 // ---------- 跨帧状态 ----------
 static bool   g_has_prev = false;
-static double g_Cx = 0, g_Cy = 0;      // 上一帧"底盘旋转中心"（水平）
-static double g_pt_pos = 0;            // 上一次"位置真的变了"的时间戳
-static double g_vx = 0, g_vy = 0;      // 底盘平移速度 m/s
-static double g_vpeak = 0;             // 见过的最大平移速度（判断换向减速）
-static double g_phi = 0;               // 上一帧"朝外"方位角 rad
-static double g_pt_phi = 0;            // 上一次"朝向真的变了"的时间戳
+static double g_Cx = 0, g_Cy = 0;      // 上一帧车心
+static double g_pt_pos = 0;            // 上次位置变化时间
+static double g_vx = 0, g_vy = 0;      // 平移速度
+static double g_vpeak = 0;             // 最大平移速度，判换向减速
+static double g_phi = 0;               // 上帧朝外方位角
+static double g_pt_phi = 0;            // 上次朝向变化时间
 static bool   g_has_prev_phi = false;
-static double g_omega = 0;             // 底盘自转角速度 rad/s
+static double g_omega = 0;             // 自转角速度
 
-// 把角度折到 (-pi, pi]
+// 折到 (-pi, pi]
 static double wrap_pi(double a)
 {
     while (a >  M_PI) a -= TAU;
@@ -35,7 +39,7 @@ static double wrap_pi(double a)
     return a;
 }
 
-// ---------- 工具函数（必须定义在使用者之前） ----------
+// ---------- 工具函数 ----------
 
 static void plate_center(const rm_aim_sim_bridge::msg::ArmorCorners & a,
                          double & cx, double & cy, double & cz)
@@ -48,13 +52,13 @@ static void plate_center(const rm_aim_sim_bridge::msg::ArmorCorners & a,
     }
 }
 
-// 板面法向（单位向量）。叉乘方向朝里还是朝外不确定。
+// 上边 × 左边归一化，方向由下面 voting 定
 static void plate_normal(const rm_aim_sim_bridge::msg::ArmorCorners & a,
                          double & nx, double & ny, double & nz)
 {
     const auto & p = a.corners;
-    double ax = p[1].x - p[0].x, ay = p[1].y - p[0].y, az = p[1].z - p[0].z;  // 上边
-    double bx = p[3].x - p[0].x, by = p[3].y - p[0].y, bz = p[3].z - p[0].z;  // 左边
+    double ax = p[1].x - p[0].x, ay = p[1].y - p[0].y, az = p[1].z - p[0].z;
+    double bx = p[3].x - p[0].x, by = p[3].y - p[0].y, bz = p[3].z - p[0].z;
     nx = ay * bz - az * by;
     ny = az * bx - ax * bz;
     nz = ax * by - ay * bx;
@@ -62,6 +66,7 @@ static void plate_normal(const rm_aim_sim_bridge::msg::ArmorCorners & a,
     if (len > 1e-9) { nx /= len; ny /= len; nz /= len; }
 }
 
+// 停控停火，header 复制观测
 static void publish_stop(const ArmorCornersArray::SharedPtr & msg)
 {
     AimCommand cmd;
@@ -94,7 +99,7 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
         return;
     }
 
-    // ================= 1. 反推"底盘旋转中心 C" =================
+    // 1. 车心 C = p − r·n。n 块板 2^n 种符号组合，取各板反推最一致的一组；单板靠上帧消歧。
     const size_t n = msg->armors.size();
     std::vector<double> px(n), py(n), pz(n), phi(n);
     for (size_t i = 0; i < n; ++i) {
@@ -150,15 +155,14 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
         rphi[i] = std::atan2(s * std::sin(phi[i]), s * std::cos(phi[i]));
     }
 
-    // ================= 2. 分别更新平移速度和自转角速度 =================
-    // 桥接会用新时间戳重复发布同一帧：位置没变就别拿去算平移速度，
-    // 朝向没变就别拿去算转速。组合场景里朝向一直在变，用"或"判据会漏进重复帧。
+    // 2. 重复帧：位置没变不算速度，朝向没变不算转速（桥接会用新时间戳重发同一帧）。
     const bool pos_moved = !g_has_prev ||
                            std::fabs(Cx - g_Cx) > 1e-6 ||
                            std::fabs(Cy - g_Cy) > 1e-6;
     const bool phi_moved = !g_has_prev_phi ||
                            std::fabs(wrap_pi(rphi[0] - g_phi)) > 1e-4;
 
+    // 相邻帧的板可能不是同一块，用 k·90° 找最接近的相位差
     double dphi = 0.0, dmin = 1e9;
     if (g_has_prev_phi) {
         for (size_t i = 0; i < n; ++i) {
@@ -175,7 +179,7 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
             if (dt > 1e-4 && dt < 0.2) {
                 double vx = (Cx - g_Cx) / dt;
                 double vy = (Cy - g_Cy) / dt;
-                if (std::hypot(vx, vy) < 8.0) {
+                if (std::hypot(vx, vy) < 8.0) {   // 剔除跳变帧
                     g_vx = vx; g_vy = vy;
                     double sp = std::hypot(g_vx, g_vy);
                     if (sp > g_vpeak) g_vpeak = sp;
@@ -196,15 +200,10 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
         g_phi = rphi[0]; g_pt_phi = tnow; g_has_prev_phi = true;
     }
 
-    // ================= 3. 预测"子弹到达那一刻"每块板在哪、朝哪 =================
-    // 注意：绕轴转动必须用「精确旋转」，不能用"板速度 × lead"的线性外推——
-    // 线性外推少了半径收缩项 R(1−cosΔθ)，Δθ=69° 时误差可达 0.16 m，比板还宽。
+    // 3. 预测 lead 后位置：绕车心精确旋转（线性外推丢 R(1−cosΔθ)，69° 时 0.158 m）。
+    //    lead = 0.015 指令生效延迟 + 飞行时间；不补射击周期，子弹用出膛瞬间的指令。
     double D_now = std::hypot(Cx, Cy);
     double tf    = D_now / V;
-    // 提前量 = 0.015 s（指令从发出到被仿真采用：桥接轮询 <=10 ms + 一帧传输）
-    //        + tf（弹丸飞行时间）
-    // 说明：10 Hz 节拍下，子弹用的是"出膛瞬间"的最新指令，所以不需要再补一个
-    // 完整射击周期；早期版本用 0.060 s 会把提前量打过头，命中率反而低。
     double lead  = 0.015 + tf;
     double dth   = g_omega * lead;
     double cs = std::cos(dth), sn = std::sin(dth);
@@ -215,7 +214,7 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
 
     for (size_t i = 0; i < n; ++i) {
         double rx = px[i] - Cx, ry = py[i] - Cy;
-        double ax = Cx + rx * cs - ry * sn + g_vx * lead;   // 绕底盘中心精确转 + 平移
+        double ax = Cx + rx * cs - ry * sn + g_vx * lead;
         double ay = Cy + rx * sn + ry * cs + g_vy * lead;
         double az = pz[i];
 
@@ -240,7 +239,7 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
         return;
     }
 
-    // ================= 4. 弹道解算 =================
+    // 4. 弹道低伸解，枪口偏移迭代 3 次
     double D  = std::hypot(aim_x, aim_y);
     double dz = aim_z;
 
@@ -253,7 +252,7 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
         e = std::atan2(V*V - std::sqrt(disc), G*d);
     }
 
-    // ================= 5. 开火判定 =================
+    // 5. 开火门限：正对 >0.8、与次优差 >0.15、不在换向减速段
     bool facing_ok = (best_face > 0.80) && ((best_face - second_face) > 0.15);
     bool near_turn = (g_vpeak > 0.5) && (std::hypot(g_vx, g_vy) < 0.9 * g_vpeak);
 
@@ -264,7 +263,7 @@ void on_armors(const ArmorCornersArray::SharedPtr msg)
            e * 180.0 / M_PI,
            (facing_ok && !near_turn) ? 1 : 0);
 
-    // ================= 6. 发指令 =================
+    // 6. 发指令
     AimCommand cmd;
     cmd.header     = msg->header;
     cmd.session_id = msg->session_id;
